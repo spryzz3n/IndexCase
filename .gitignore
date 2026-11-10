@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# case data and outputs
+*.evtx
+*.parquet
+hunt.json
+result.json
+report.html
+cases/
+*.pdf
+scan.json
