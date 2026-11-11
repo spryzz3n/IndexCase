@@ -14,7 +14,8 @@ Early work in progress.
 - [x] Project setup and CI
 - [x] Read `.evtx` files and `.jsonl` exports
 - [x] Normalized event schema, stored as Parquet
-- [ ] Event mappers and IP to host resolution
+- [x] Event mappers for Security, System and Sysmon
+- [ ] IP to host resolution
 - [ ] Malware profiles and host matching
 - [ ] Edge reconstruction (SMB + service, WMI, scheduled task)
 - [ ] Patient zero ranking and report
