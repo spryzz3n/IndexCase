@@ -17,3 +17,6 @@ report.html
 cases/
 *.pdf
 scan.json
+
+# lab secrets and host details
+*.local.md
