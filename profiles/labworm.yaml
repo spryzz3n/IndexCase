@@ -1,0 +1,41 @@
+name: LabWorm-v1
+version: 1
+description: Benign lab worm that spreads via ADMIN$ copy + service install, WMI or scheduled task
+
+indicators:
+  sha256:
+    - value: "85a7bef889d2be5d3ff145fc8e1d1af1250431fd70bd4f17de47b0edfb64ee2b"
+      weight: 1.0
+  filenames:
+    - value: "svchost32.exe"
+      weight: 0.3
+  paths:
+    - regex: '(?i)\\Windows\\Temp\\svchost32\.exe$'
+      weight: 0.5
+  pipes:
+    - regex: '(?i)^\\labworm_'
+      weight: 0.8
+  registry_set:
+    - regex: '(?i)\\CurrentVersion\\Run\\Updater$'
+      weight: 0.6
+  domains:
+    - value: "c2.lab.local"
+      weight: 0.7
+  cmdline:
+    - regex: '(?i)svchost32\.exe\s+--spread'
+      weight: 0.7
+
+behaviors:
+  - name: service-launch
+    parent: '(?i)\\services\.exe$'
+    child: '(?i)\\svchost32\.exe$'
+    weight: 0.8
+
+propagation:
+  techniques: [T1021.002, T1569.002, T1047, T1053.005]
+  service_name_regex: '(?i)^LabWormSvc$'
+
+matching:
+  infected_threshold: 1.0
+  window_minutes: 5
+  clock_tolerance_seconds: 120
