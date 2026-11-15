@@ -16,7 +16,7 @@ Early work in progress.
 - [x] Normalized event schema, stored as Parquet
 - [x] Event mappers for Security, System and Sysmon
 - [x] IP to host resolution
-- [ ] Malware profiles and host matching
+- [x] Malware profiles and host matching
 - [ ] Edge reconstruction (SMB + service, WMI, scheduled task)
 - [ ] Patient zero ranking and report
 
