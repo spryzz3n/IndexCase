@@ -87,6 +87,16 @@ def test_service_push_tied_by_logon_id(profile):
     core = edge["evidence"]["core"]
     assert len(core) == 4  # logon, 4697, 7045, payload start
     assert len(edge["evidence"]["support"]) == 2  # admin share, privileges
+    assert edge["terms"] == {
+        "auth": 1.0,
+        "transfer": 1.0,
+        "exec": 1.0,
+        "match": 1.0,
+        "gap": 0.007,
+        "baseline": 0.0,
+    }
+    assert edge["score"] == 0.999
+    assert edge["label"] == "confirmed"
 
 
 def test_time_only_tie_is_noted(profile):
@@ -94,6 +104,8 @@ def test_time_only_tie_is_noted(profile):
     (edge,) = correlate(events, profile)
     assert edge["src"] == "ws01"
     assert "logon tied to execution by time only" in edge["notes"]
+    assert edge["terms"]["exec"] == 0.5
+    assert edge["score"] == 0.824
 
 
 def test_local_session_gives_no_edge(profile):
@@ -171,3 +183,114 @@ def test_index_lookups():
     assert len(idx.to("ws02", "net_conn", at(5), at(15))) == 1
     assert idx.to("ws02", "net_conn", at(11)) == []
     assert len(idx.to("ip:10.0.0.12", "net_conn")) == 1
+
+
+def test_wmi_payload_found_as_grandchild(profile):
+    events = background("ws01", "ws02") + [
+        ev(
+            "ws02",
+            at(60),
+            "logon",
+            logon_type=3,
+            logon_id="0xd4",
+            user="lab\\helpdesk1",
+            src_host="ws01",
+        ),
+        ev(
+            "ws02",
+            at(61),
+            "process",
+            SYSMON,
+            logon_id="0xd4",
+            process_guid="{g1}",
+            process_path=r"C:\Windows\System32\cmd.exe",
+            cmdline="cmd.exe /Q /c run.bat",
+            parent_path=r"C:\Windows\System32\wbem\WmiPrvSE.exe",
+        ),
+        ev(
+            "ws02",
+            at(62),
+            "process",
+            SYSMON,
+            logon_id="0xd4",
+            parent_guid="{g1}",
+            process_path=WORM,
+            parent_path=r"C:\Windows\System32\cmd.exe",
+            sha256=WORM_SHA256,
+        ),
+    ]
+    (edge,) = correlate(events, profile)
+    assert (edge["src"], edge["technique"]) == ("ws01", "T1047")
+    assert len(edge["evidence"]["core"]) == 3  # logon, cmd.exe, payload
+    assert edge["terms"]["exec"] == 1.0
+
+
+def test_scheduled_task_with_payload(profile):
+    events = background("ws01", "ws02") + [
+        ev(
+            "ws02",
+            at(60),
+            "logon",
+            logon_type=3,
+            logon_id="0xe5",
+            user="lab\\helpdesk1",
+            src_host="ws01",
+        ),
+        ev("ws02", at(61), "task_create", logon_id="0xe5", task_name="\\Updater"),
+        start("ws02", at(90), r"C:\Windows\System32\svchost.exe"),
+    ]
+    (edge,) = correlate(events, profile)
+    assert (edge["src"], edge["technique"]) == ("ws01", "T1053.005")
+    assert edge["label"] == "confirmed"
+
+
+def test_edge_into_suspected_host_is_capped(profile):
+    # file name and path only: weak match, so ws02 is merely suspected
+    events = background("ws01", "ws02") + psexec_push("ws01", "ws02", 60)[:-1]
+    (edge,) = correlate(events, profile)
+    assert edge["terms"]["match"] == 0.5
+    assert edge["score"] == 0.69
+    assert edge["label"] == "probable"
+    assert "target is only a suspected match" in edge["notes"]
+
+
+def test_source_infected_after_the_push_is_penalised(profile):
+    events = background("ws01", "ws02") + psexec_push("ws01", "ws02", 60)
+    events.append(start("ws01", at(600), r"C:\x\explorer.exe"))
+    (edge,) = correlate(events, profile)
+    assert edge["score"] == 0.699
+    assert edge["label"] == "probable"
+    assert "source shows the malware only after this execution" in edge["notes"]
+
+
+def test_routine_admin_logon_penalised_only_when_tied_by_time(profile):
+    routine = [
+        ev(
+            "ws02",
+            T0 - timedelta(days=d),
+            "logon",
+            logon_type=3,
+            logon_id=f"0x{d}",
+            user="lab\\helpdesk1",
+            src_host="ws01",
+        )
+        for d in range(1, 6)
+    ]
+    timed = routine + psexec_push("ws01", "ws02", 60, tie=False)
+    (edge,) = correlate(timed, profile)
+    assert edge["terms"]["baseline"] == 1.0
+    assert edge["label"] == "probable"
+
+    tied = routine + psexec_push("ws01", "ws02", 60)
+    (edge,) = correlate(tied, profile)
+    assert edge["terms"]["baseline"] == 0.0
+    assert edge["label"] == "confirmed"
+
+
+def test_best_edge_kept_per_pair(profile):
+    events = background("ws01", "ws02")
+    events += psexec_push("ws01", "ws02", 60, lid="0xf1", tie=False)
+    events += psexec_push("ws01", "ws02", 400, lid="0xf2")
+    (edge,) = correlate(events, profile)
+    assert edge["logon_id"] == "0xf2"
+    assert edge["terms"]["exec"] == 1.0

@@ -1,8 +1,8 @@
-"""Evidence-chain finders: turn "malware ran on B" into A -> B edges.
+"""Evidence-chain finders: turn "malware ran on B" into scored A -> B edges.
 
-An edge needs a remote-execution anchor on B (a service install) that is tied
-to the malware profile, plus an authentication that says where it came from.
-Everything else is supporting evidence.
+An edge needs a remote-execution anchor on B (service install, WmiPrvSE child,
+scheduled task) that is tied to the malware profile, plus an authentication
+that says where it came from. Everything else only raises the score.
 """
 
 from __future__ import annotations
@@ -16,16 +16,23 @@ from indexcase.correlate.index import EventIndex
 from indexcase.hunt.matcher import Matcher
 from indexcase.normalize.mappers import bare_user, basename
 from indexcase.profile.models import MalwareProfile
+from indexcase.timeutil import parse_ts
 
 TECHNIQUES = {
     "service": ("T1021.002+T1569.002", "SMB + service execution"),
+    "wmi": ("T1047", "WMI"),
+    "task": ("T1053.005", "Scheduled task"),
 }
 
 # SYSTEM, LOCAL SERVICE, NETWORK SERVICE sessions never identify a remote caller
 SYSTEM_LOGON_IDS = {"0x3e7", "0x3e5", "0x3e4"}
+LATERAL_PORTS = {135, 445, 5985, 5986}
 
 _ADMIN_SHARE = re.compile(r"(?i)\\(admin|c|ipc)\$")
 _TOOL_PIPE = re.compile(r"(?i)\\?(psexesvc|remcom)")
+_REMOTE_TOOL = re.compile(
+    r"(?i)\b(wmic|schtasks|psexec\w*|sc|invoke-wmimethod|invoke-cimmethod|invoke-command)\b"
+)
 
 
 @dataclass
@@ -63,8 +70,14 @@ class Correlator:
         self.hosts: dict[str, dict] = hunt_result["hosts"]
         self.window = timedelta(minutes=profile.matching.window_minutes)
         self.tol = timedelta(seconds=profile.matching.clock_tolerance_seconds)
+        self.first_seen: dict[str, datetime] = {
+            h: parse_ts(v["t_first_seen"]) for h, v in self.hosts.items() if v["t_first_seen"]
+        }
+        infected = [t for h, t in self.first_seen.items() if self.hosts[h]["status"] == "infected"]
+        self.incident_start = min(infected) if infected else None
         hint = profile.propagation.service_name_regex
         self._svc_hint = re.compile(hint) if hint else None
+        self._baseline_cache: dict[tuple, float] = {}
 
     # --- anchors ---------------------------------------------------------------
 
@@ -108,8 +121,39 @@ class Correlator:
             out.append(Anchor("service", ev, weight, refs))
         return out
 
+    def _wmi_anchors(self, host: str) -> list[Anchor]:
+        out = []
+        for p in self.idx.on(host, "process"):
+            if basename(p["parent_path"]) != "wmiprvse.exe":
+                continue
+            weight, refs = self.m.weight(p), [p["event_ref"]]
+            if p["process_guid"]:
+                # wmiexec.py runs cmd.exe /Q /c <payload>: the payload is a grandchild
+                for child in self.idx.children.get((host, p["process_guid"]), []):
+                    w = self.m.weight(child)
+                    if w > weight:
+                        weight = w
+                        refs = [p["event_ref"], child["event_ref"]]
+            if weight > 0:
+                out.append(Anchor("wmi", p, weight, refs))
+        return out
+
+    def _task_anchors(self, host: str) -> list[Anchor]:
+        out = []
+        for ev in self.idx.on(host, "task_create"):
+            weight, refs = self.m.weight(ev), [ev["event_ref"]]
+            payload = self._payload(
+                host, ev["ts_utc"], self.cfg.task_follow_s, {"svchost.exe", "taskeng.exe"}
+            )
+            if payload:
+                weight = max(weight, self.m.weight(payload))
+                refs.append(payload["event_ref"])
+            if weight > 0:
+                out.append(Anchor("task", ev, weight, refs))
+        return out
+
     def anchors(self, host: str) -> list[Anchor]:
-        return self._service_anchors(host)
+        return self._service_anchors(host) + self._wmi_anchors(host) + self._task_anchors(host)
 
     # --- authentication --------------------------------------------------------
 
@@ -151,9 +195,25 @@ class Correlator:
                 return evs[-1]
         return None
 
+    def _baseline(self, account: str | None, src: str, dst: str) -> float:
+        """1.0 when this account logs on from src to dst on most days before the incident."""
+        if self.incident_start is None or not account:
+            return 0.0
+        key = (bare_user(account), src, dst)
+        if key not in self._baseline_cache:
+            start = self.incident_start - timedelta(days=self.cfg.baseline_days)
+            days = {
+                s["ts_utc"].date()
+                for s in self.idx.on(dst, "logon", start, self.incident_start - self.window)
+                if s["logon_type"] == 3 and bare_user(s["user"]) == key[0] and _source(s) == src
+            }
+            self._baseline_cache[key] = 1.0 if len(days) >= self.cfg.baseline_min_days else 0.0
+        return self._baseline_cache[key]
+
     # --- edges -----------------------------------------------------------------
 
     def _edge(self, dst: str, a: Anchor) -> dict | None:
+        cfg, w = self.cfg, self.cfg.edge
         t_exec = a.ev["ts_utc"]
         logon, tied, n_sources, local = self._find_logon(dst, a)
         if local:
@@ -161,7 +221,7 @@ class Correlator:
 
         core, support, notes = list(a.refs), [], []
         if logon is not None:
-            src = _source(logon)
+            src, auth = _source(logon), 1.0
             t_logon, account, lid = logon["ts_utc"], logon["user"], logon["logon_id"]
             core.insert(0, logon["event_ref"])
             if not tied:
@@ -172,7 +232,7 @@ class Correlator:
             alt = self._source_side_auth(dst, t_exec)
             if alt is None:
                 return None
-            src = alt["src_host"]
+            src, auth = alt["src_host"], 0.5
             t_logon, account, lid = alt["ts_utc"], alt["user"], None
             support.append(alt["event_ref"])
             notes.append("no network logon on the target; source taken from 4648 / DC ticket")
@@ -180,15 +240,18 @@ class Correlator:
             return None
 
         # transfer: payload written over an admin share, or seen landing on disk
+        transfer_refs = []
         for s in self.idx.on(dst, "share_access", t_logon - self.tol, t_exec + self.tol):
             same_session = (lid and s["logon_id"] == lid) or (not lid and _source(s) == src)
             if same_session and _ADMIN_SHARE.search(s["file_path"] or ""):
-                support.append(s["event_ref"])
+                transfer_refs.append(s["event_ref"])
                 break
         for f in self.idx.on(dst, "file_create", t_exec - self.window, t_exec + self.tol):
             if self.m.weight(f) > 0:
-                support.append(f["event_ref"])
+                transfer_refs.append(f["event_ref"])
                 break
+        transfer = 1.0 if transfer_refs else 0.0
+        support += transfer_refs
 
         if lid:
             for p in self.idx.on(dst, "privilege", t_logon - self.tol, t_exec + self.tol):
@@ -199,6 +262,29 @@ class Correlator:
             if _TOOL_PIPE.search(p["pipe_name"] or ""):
                 support.append(p["event_ref"])
                 break
+        support += self._source_side_support(src, dst, t_logon, t_exec, account)
+
+        window_s = self.window.total_seconds()
+        gap = min(1.0, max(0.0, (t_exec - t_logon).total_seconds() / window_s))
+        exec_term = 1.0 if tied else 0.5
+        match = 1.0 if a.weight >= cfg.strong_weight else 0.5
+        # a routine admin logon is only a problem when time is all that links it to the run
+        baseline = 0.0 if tied else self._baseline(account, src, dst)
+        if baseline:
+            notes.append("this account logs on from this source to this host routinely")
+
+        score = min(
+            1.0, w.auth * auth + w.transfer * transfer + w.exec * exec_term + w.match * match
+        )
+        score -= w.gap_penalty * gap + w.baseline_penalty * baseline
+        src_first = self.first_seen.get(src)
+        if src_first is not None and t_exec + self.tol < src_first:
+            score -= w.order_penalty
+            notes.append("source shows the malware only after this execution")
+        if self.hosts[dst]["status"] == "suspected":
+            score = min(score, cfg.suspected_cap)
+            notes.append("target is only a suspected match")
+        score = round(max(0.0, score), 3)
 
         technique, name = TECHNIQUES[a.kind]
         return {
@@ -210,16 +296,60 @@ class Correlator:
             "t_exec": t_exec,
             "account": account,
             "logon_id": lid,
+            "score": score,
+            "label": self._label(score),
+            "terms": {
+                "auth": auth,
+                "transfer": transfer,
+                "exec": exec_term,
+                "match": match,
+                "gap": round(gap, 3),
+                "baseline": baseline,
+            },
             "evidence": {"core": core, "support": list(dict.fromkeys(support))},
             "notes": notes,
         }
 
+    def _source_side_support(
+        self, src: str, dst: str, t_logon: datetime, t_exec: datetime, account: str | None
+    ) -> list[str]:
+        refs = []
+        t0, t1 = t_logon - self.window, t_exec + self.tol
+        if not src.startswith("ip:"):
+            for n in self.idx.on(src, "net_conn", t0, t1):
+                if n["dst_host"] == dst and n["dst_port"] in LATERAL_PORTS:
+                    refs.append(n["event_ref"])
+                    break
+            for e in self.idx.on(src, "logon_explicit", t0, t1):
+                if e["dst_host"] == dst:
+                    refs.append(e["event_ref"])
+                    break
+            for p in self.idx.on(src, "process", t0, t1):
+                cmd = (p["cmdline"] or "").lower()
+                if dst in cmd and _REMOTE_TOOL.search(cmd):
+                    refs.append(p["event_ref"])
+                    break
+        want = bare_user(account)
+        for k in self.idx.to(dst, "kerberos", t0, t1):
+            if want and bare_user(k["user"]) == want:
+                refs.append(k["event_ref"])
+                break
+        return refs
+
+    def _label(self, score: float) -> str:
+        if score >= self.cfg.confirmed:
+            return "confirmed"
+        return "probable" if score >= self.cfg.probable else "candidate"
+
     def edges(self) -> list[dict]:
-        """One edge per source, target and technique: the earliest execution."""
-        first: dict[tuple, dict] = {}
+        best: dict[tuple, dict] = {}
         for dst in self.hosts:
             for anchor in self.anchors(dst):
                 e = self._edge(dst, anchor)
-                if e is not None:
-                    first.setdefault((e["src"], e["dst"], e["technique"]), e)
-        return sorted(first.values(), key=lambda e: (e["t_exec"], e["src"], e["dst"]))
+                if e is None:
+                    continue
+                key = (e["src"], e["dst"], e["technique"])
+                cur = best.get(key)
+                if cur is None or (e["score"], cur["t_exec"]) > (cur["score"], e["t_exec"]):
+                    best[key] = e
+        return sorted(best.values(), key=lambda e: (e["t_exec"], e["src"], e["dst"]))
