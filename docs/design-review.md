@@ -1,6 +1,6 @@
-# Design review: changes to the original build overview
+# Design review
 
-Notes from reviewing the build overview against existing tools and against how
+Notes from reviewing the first design against existing tools and against how
 real intrusions look. Each item says what changes in the MVP.
 
 ## Where IndexCase sits
@@ -48,7 +48,7 @@ can say "outside log coverage".**
 5. **Too few scenarios for the accuracy targets.**
    Top-1 accuracy over three held-out runs is not a measurement.
    *Change:* script randomised topologies (30+ runs) and perturb captured logs
-   (drop a host, add skew, truncate) to multiply them. `tests/synth.py` is the
+   (drop a host, add skew, truncate) to multiply them. `src/indexcase/synth.py` is the
    start of this.
 
 6. **The patient-zero score was mostly the baseline.**
@@ -61,7 +61,7 @@ can say "outside log coverage".**
    7045 has no logon ID and the payload runs as SYSTEM.
    *Change:* tie through 4697 / 4698 / 5145 `SubjectLogonId` when present, fall
    back to time proximity with a lower `exec` term. Needs checking against real
-   lab logs in week 5.
+   lab logs.
 
 8. **`match` double-counted.**
    Both ends are already profile matches.
@@ -106,7 +106,7 @@ Engine: `yara-x`, as an optional dependency.
 ## Open questions, decided
 
 - LabWorm in C# (PyInstaller's bootstrap process muddies process trees).
-- Lab built with GOAD-light.
+- Lab built by hand on Proxmox (see `lab/README.md`) rather than with GOAD-light.
 - Apache 2.0.
 - Suspected hosts take part in edge building, capped at "probable".
 
