@@ -30,6 +30,11 @@ class Config:
     service_follow_s: int = 60
     task_follow_s: int = 120
 
+    # inferred edges into hosts we have no logs for
+    inferred_lookback_s: int = 1800
+    inferred_score_auth: float = 0.45
+    inferred_score_net: float = 0.40
+
     # account -> host pairs seen on this many of the previous days are routine
     baseline_days: int = 7
     baseline_min_days: int = 4

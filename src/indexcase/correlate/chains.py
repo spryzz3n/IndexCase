@@ -22,6 +22,7 @@ TECHNIQUES = {
     "service": ("T1021.002+T1569.002", "SMB + service execution"),
     "wmi": ("T1047", "WMI"),
     "task": ("T1053.005", "Scheduled task"),
+    "unknown": ("unknown", "Inferred from source-side evidence"),
 }
 
 # SYSTEM, LOCAL SERVICE, NETWORK SERVICE sessions never identify a remote caller
@@ -68,6 +69,7 @@ class Correlator:
         self.idx = index or EventIndex(events)
         self.m = matcher or Matcher(profile)
         self.hosts: dict[str, dict] = hunt_result["hosts"]
+        self.coverage: dict[str, dict] = hunt_result["coverage"]
         self.window = timedelta(minutes=profile.matching.window_minutes)
         self.tol = timedelta(seconds=profile.matching.clock_tolerance_seconds)
         self.first_seen: dict[str, datetime] = {
@@ -341,6 +343,58 @@ class Correlator:
             return "confirmed"
         return "probable" if score >= self.cfg.probable else "candidate"
 
+    def _inferred(self, edges: list[dict]) -> list[dict]:
+        """Edges into sources we hold no logs for, from what other hosts saw."""
+        first_use: dict[str, datetime] = {}
+        for e in edges:
+            if e["src"] not in self.coverage:
+                first_use[e["src"]] = min(first_use.get(e["src"], e["t_logon"]), e["t_logon"])
+
+        out = []
+        for node, t in first_use.items():
+            t0 = t - timedelta(seconds=self.cfg.inferred_lookback_s)
+            found: dict[str, dict] = {}
+            for cat in ("logon_explicit", "kerberos", "net_conn"):
+                for ev in self.idx.to(node, cat, t0, t):
+                    src = ev["src_host"]
+                    if not src or src == node or src not in self.hosts:
+                        continue
+                    if cat == "net_conn" and ev["dst_port"] not in LATERAL_PORTS:
+                        continue
+                    if cat == "kerberos" and not _human(ev):
+                        continue
+                    score = (
+                        self.cfg.inferred_score_net
+                        if cat == "net_conn"
+                        else self.cfg.inferred_score_auth
+                    )
+                    slot = found.setdefault(src, {"score": 0.0, "refs": [], "t": ev["ts_utc"]})
+                    slot["score"] = max(slot["score"], score)
+                    slot["refs"].append(ev["event_ref"])
+                    slot["t"] = min(slot["t"], ev["ts_utc"])
+            for src, info in found.items():
+                technique, name = TECHNIQUES["unknown"]
+                out.append(
+                    {
+                        "src": src,
+                        "dst": node,
+                        "technique": technique,
+                        "technique_name": name,
+                        "t_logon": info["t"],
+                        "t_exec": info["t"],
+                        "account": None,
+                        "logon_id": None,
+                        "score": info["score"],
+                        "label": "inferred",
+                        "terms": {},
+                        "evidence": {"core": [], "support": info["refs"][:10]},
+                        "notes": [
+                            "no logs for the target; inferred from source-side evidence only"
+                        ],
+                    }
+                )
+        return out
+
     def edges(self) -> list[dict]:
         best: dict[tuple, dict] = {}
         for dst in self.hosts:
@@ -352,4 +406,6 @@ class Correlator:
                 cur = best.get(key)
                 if cur is None or (e["score"], cur["t_exec"]) > (cur["score"], e["t_exec"]):
                     best[key] = e
-        return sorted(best.values(), key=lambda e: (e["t_exec"], e["src"], e["dst"]))
+        edges = list(best.values())
+        edges += self._inferred(edges)
+        return sorted(edges, key=lambda e: (e["t_exec"], e["src"], e["dst"]))

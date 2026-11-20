@@ -294,3 +294,50 @@ def test_best_edge_kept_per_pair(profile):
     (edge,) = correlate(events, profile)
     assert edge["logon_id"] == "0xf2"
     assert edge["terms"]["exec"] == 1.0
+
+
+def no_logs_hop(source_side):
+    """ws01 reaches ws03 (no logs collected), and ws03 then pushes to ws02."""
+    events = background("ws01", "ws02") + [start("ws01", at(0), r"C:\x\explorer.exe")]
+    events += source_side
+    events += psexec_push("ws03", "ws02", 600)
+    return events
+
+
+def test_inferred_edge_into_host_without_logs(profile):
+    events = no_logs_hop(
+        [
+            ev(
+                "ws01",
+                at(300),
+                "logon_explicit",
+                user="lab\\helpdesk1",
+                src_host="ws01",
+                dst_host="ws03",
+            )
+        ]
+    )
+    edges = correlate(events, profile)
+    assert [(e["src"], e["dst"], e["label"]) for e in edges] == [
+        ("ws01", "ws03", "inferred"),
+        ("ws03", "ws02", "confirmed"),
+    ]
+    inferred = edges[0]
+    assert inferred["technique"] == "unknown"
+    assert inferred["score"] == 0.45
+    assert inferred["evidence"]["core"] == []
+    assert len(inferred["evidence"]["support"]) == 1
+
+
+def test_inferred_edge_from_network_connection_only(profile):
+    smb = ev("ws01", at(300), "net_conn", SYSMON, src_host="ws01", dst_host="ws03", dst_port=445)
+    web = ev("ws01", at(310), "net_conn", SYSMON, src_host="ws01", dst_host="ws03", dst_port=80)
+    (inferred, _) = correlate(no_logs_hop([smb, web]), profile)
+    assert (inferred["src"], inferred["dst"]) == ("ws01", "ws03")
+    assert inferred["score"] == 0.40
+    assert inferred["evidence"]["support"] == [smb["event_ref"]]
+
+
+def test_no_inferred_edge_without_source_side_evidence(profile):
+    edges = correlate(no_logs_hop([]), profile)
+    assert [(e["src"], e["dst"]) for e in edges] == [("ws03", "ws02")]
