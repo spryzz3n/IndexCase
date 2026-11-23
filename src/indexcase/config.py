@@ -18,8 +18,18 @@ class EdgeWeights:
 
 
 @dataclass(frozen=True)
+class RootWeights:
+    earliness: float = 0.30
+    coverage: float = 0.35
+    initial_access: float = 0.20
+    completeness: float = 0.15
+    unexplained_auth: float = 0.10
+
+
+@dataclass(frozen=True)
 class Config:
     edge: EdgeWeights = field(default_factory=EdgeWeights)
+    root: RootWeights = field(default_factory=RootWeights)
 
     confirmed: float = 0.70
     probable: float = 0.40

@@ -341,3 +341,21 @@ def test_inferred_edge_from_network_connection_only(profile):
 def test_no_inferred_edge_without_source_side_evidence(profile):
     edges = correlate(no_logs_hop([]), profile)
     assert [(e["src"], e["dst"]) for e in edges] == [("ws03", "ws02")]
+
+
+def test_unexplained_inbound_logon_reported(profile):
+    # ws01 logs on to ws02 just before ws02 shows the malware, but no execution ties them
+    logon = ev(
+        "ws02", at(30), "logon", logon_type=3, logon_id="0x99", user="lab\\helpdesk1",
+        src_host="ws01",
+    )  # fmt: skip
+    events = background("ws01", "ws02") + [
+        start("ws01", at(0), r"C:\x\explorer.exe"),
+        logon,
+        start("ws02", at(60), r"C:\x\explorer.exe"),
+    ]
+    h = hunt(events, profile)
+    corr = Correlator(events, h, profile, index=EventIndex(events))
+    edges = corr.edges()
+    assert edges == []
+    assert corr.unexplained_inbound(edges) == {"ws02": [logon["event_ref"]]}

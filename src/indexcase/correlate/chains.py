@@ -409,3 +409,21 @@ class Correlator:
         edges = list(best.values())
         edges += self._inferred(edges)
         return sorted(edges, key=lambda e: (e["t_exec"], e["src"], e["dst"]))
+
+    def unexplained_inbound(self, edges: list[dict]) -> dict[str, list[str]]:
+        """Network logons from other matched hosts just before first-seen that no edge explains."""
+        explained = {(e["src"], e["dst"]) for e in edges if e["label"] != "candidate"}
+        out: dict[str, list[str]] = {}
+        for host, t in self.first_seen.items():
+            refs = [
+                s["event_ref"]
+                for s in self.idx.on(host, "logon", t - self.window, t + self.tol)
+                if s["logon_type"] == 3
+                and _human(s)
+                and _source(s) in self.hosts
+                and _source(s) != host
+                and (_source(s), host) not in explained
+            ]
+            if refs:
+                out[host] = refs[:5]
+        return out
